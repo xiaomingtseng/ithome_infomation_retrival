@@ -1,78 +1,136 @@
 import requests
 from bs4 import BeautifulSoup
-from database import Database  # 引入資料庫類別
-from datetime import datetime
+import multiprocessing
 from pymongo.errors import DuplicateKeyError  # 引入 DuplicateKeyError
-import time  # 引入 time 模組
+from database import Database  # 引入資料庫類別
 
-# 初始化資料庫
-db_instance = Database()
-news_collection = db_instance.get_collection('news')  # 使用 'news' 集合
 
-# 定義 iThome 文章的 URL 模板
-base_url = "https://ithelp.ithome.com.tw/articles?page={}"  # iThome 的文章分頁 URL
+# 头部信息，模拟浏览器请求
 headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36'
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
 }
 
-# 爬取前 50 頁的文章（假設每頁 10 篇，共 500 篇）
-for page in range(1, 51):  # 修改範圍以爬取更多頁
-    url = base_url.format(page)
-    print(f"正在爬取: {url}")
-    response = requests.get(url, headers=headers)
+# 基础参数
+base_url = "https://www.ithome.com.tw/news"
+num_workers = 8
 
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.text, 'html.parser')
+json_file = "ithome_news.json"
 
-        # 找到每篇文章的連結
-        articles = soup.find_all('a', class_='qa-list__title-link')  # 根據 iThome 的文章標題 class
-        for article in articles:
-            title = article.get_text(strip=True)
-            href = article['href']
+class Dump:
+    def __init__(self, queue):
+        self.queue = queue
+        self.first_json_entry = True  # 记录是否是第一个 JSON 数据
+        self.db_instance = None
+        self.db_news_collection = None
+        print("init")
 
-            # 檢查 href 是否為完整 URL
-            if href.startswith('http'):
-                link = href
+        # 初始化 JSON，写入 `[`
+        with open(json_file, "w", encoding="utf-8") as f:
+            f.write("[\n")
+
+
+    def save(self, data):
+        # 手写 JSON 格式
+        with open(json_file, "a", encoding="utf-8") as f:
+            if not self.first_json_entry:
+                f.write(",\n")  # 追加逗号换行，分隔 JSON 项
+            self.first_json_entry = False  # 之后所有数据前都需要加逗号
+            f.write(f'  {{"_id": "{data["_id"]}","url": "{data["url"]}","date": "{data["date"]}","title": "{data["title"]}","content":"{data["content"]}"}}')
+
+            # 將資料存入 MongoDB
+        try:
+            self.db_news_collection.insert_one(data)
+            print("資料已存入資料庫")
+        except DuplicateKeyError:
+            print("資料已存在，跳過")
+
+
+    def data_analyze(self):
+        self.db_instance = Database()
+        self.db_news_collection = self.db_instance.get_collection('newsgaha')
+
+        while True:
+            (news_id, data) = self.queue.get()
+            if news_id == -1:
+                with open(json_file, "a", encoding="utf-8") as f:
+                    f.write("]")
+                break
+            soup = BeautifulSoup(data, "html.parser")
+            title_tag = soup.find("h1", class_="page-header")  # 文章标题
+            #summary_tag = soup.find("div", class_="content-summary")
+            date_tag = soup.find("span", class_="created")
+            content_tag = soup.find("div", class_="field field-name-body field-type-text-with-summary field-label-hidden")
+
+            if title_tag and content_tag:
+                title = title_tag.get_text(strip=True).replace('"', "'")  # 替换双引号，防止 JSON 解析错误
+                content = content_tag.get_text(strip=True).replace('"', "'")  # 替换双引号
+                date = date_tag.get_text(strip=True).replace('"', "'")
+                url = f"{base_url}/{news_id}"
+                print(f"成功爬取: {news_id} - {title}")
+                data = {"_id": url,
+                        "url": url,
+                        "date": date,
+                        "title": title,
+                        "content": content,
+                        }
+                self.save(data)  # 送入队列
             else:
-                link = "https://ithelp.ithome.com.tw" + href  # 拼接完整連結
+                print(f"跳过: {news_id} - 可能是无效页面")
 
-            print(f"標題: {title}")
-            print(f"連結: {link}")
+def fetch_news(news_id, queue):
+    url = f"{base_url}/{news_id}"
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            queue.put((news_id, response.text)) #送入分析對列
+        else:
+            print(f"失败: {news_id} - HTTP 状态码 {response.status_code}")
+    except requests.RequestException as e:
+        print(f"请求错误: {news_id} - {e}")
 
-            # 爬取文章內容
-            article_response = requests.get(link, headers=headers)
-            if article_response.status_code == 200:
-                article_soup = BeautifulSoup(article_response.text, 'html.parser')
+def get_all_link(start, end):
+    news_ids = []
+    for page in range(start, end+1):  # 修改範圍以爬取更多頁
+        url = f'{base_url}?page={page}'
+        print(f"正在爬取: {url}")
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # 找到每篇文章的連結
+            titles = soup.find_all('div', class_='view-content')[1].find_all('p', class_='title')  # 根據 iThome 的文章標題 class
+            print(titles)
+            for article in titles:
+                print(article.text)
+                a_tag = article.find('a')
+                href = a_tag['href']
+                news_id = int(href.split('/')[-1])
+                news_ids.append(news_id)
+    news_ids = list(set(news_ids))
+    news_ids.sort()
+    news_ids = news_ids[::-1]
+    news_ids.append(-1)
+    return news_ids
 
-                # 提取文章內容
-                content = article_soup.find('div', class_='markdown__style').get_text(strip=True)  # 根據文章內容的 class
+def main():
+    manager = multiprocessing.Manager()
+    queue = manager.Queue()  # 使用 Manager 创建共享队列
 
-                # 提取文章的發佈時間
-                time_element = article_soup.find('a', class_='qa-header__info-time')  # 根據時間的 class
-                if time_element:
-                    published_time = time_element.get_text(strip=True)
-                else:
-                    published_time = None  # 如果找不到時間，設為 None
+    # 创建数据存储进程
+    dump = Dump(queue)
+    dump_process = multiprocessing.Process(target=dump.data_analyze)
+    dump_process.start()
 
-                print(f"內容: {content[:100]}...")  # 只顯示前 100 個字
-                print(f"發佈時間: {published_time}")
+    pool = multiprocessing.Pool(num_workers)
+    #news_id_list = [i for i in range(0, 321+1)]
+    #links = pool.starmap(get_all_link, [(news_id, news_id) for news_id in news_id_list])  # 使用 starmap 传递参数
+    links = get_all_link(0, 321)
+    print(links)
 
-                # 將資料存入 MongoDB
-                try:
-                    news_collection.insert_one({
-                        '_id': link,  # 使用文章連結作為唯一 ID，避免重複
-                        'title': title,
-                        'link': link,
-                        'content': content,
-                        'published_time': published_time,  # 儲存發佈時間
-                        'scraped_time': datetime.now()  # 紀錄爬取時間
-                    })
-                    print("資料已存入資料庫")
-                except DuplicateKeyError:
-                    print("資料已存在，跳過")
-            else:
-                print(f"無法訪問文章內容，狀態碼: {article_response.status_code}")
-            print("-" * 50)
-            time.sleep(1)  # 延遲 1 秒
-    else:
-        print(f"無法訪問分頁，狀態碼: {response.status_code}")
+    # 多进程爬取
+    pool.starmap(fetch_news, [(news_id, queue) for news_id in links])  # 使用 starmap 传递参数
+    # 发送结束信号
+    dump_process.join()
+    print(f"所有新闻已爬取，数据已存入 {json_file}")
+
+if __name__ == "__main__":
+    main()
