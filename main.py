@@ -61,10 +61,25 @@ if __name__ == "__main__":
 
         # 使用 TextAnalyzer 過濾停用詞並斷詞
         tokens = analyzer.preprocess(content)
-        print("過濾後的 tokens:", tokens)
+        # print("過濾後的 tokens:", tokens)
+
+        tf_idf_keywords = extract_keywords_with_tfidf(
+            TFIDFAnalyzer(), [{'content': content}], top_k=10
+        )
+
+        
+
+        # print(f"TF-IDF 關鍵字(前10)：{tf_idf_keywords}")
+        # print("-" * 50)
 
         # 使用 KMeans 提取關鍵字（2~3 個）
-        kmeans_keywords = extract_keywords_with_kmeans(embedder, tokens, n_clusters=3)
+        kmeans_keywords = extract_keywords_with_kmeans(embedder, tokens, n_clusters=10)
+
+        # 將結果寫入 .txt 檔案
+        with open("kmeans_keywords.txt", "a", encoding="utf-8") as f:
+            f.write(f"文章內容：{content[:50]}...\n")
+            f.write(f"KMeans 關鍵字：{', '.join(kmeans_keywords)}\n")
+            f.write("-" * 50 + "\n")
 
         # 輸出結果
         print(f"文章內容：{content[:50]}...")
